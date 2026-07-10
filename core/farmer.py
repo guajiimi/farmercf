@@ -111,6 +111,31 @@ async def _req(session, method, url, payload=None, extra=None, proxy=None):
     return None
 
 
+async def _req_with_headers(session, method, url, payload=None, extra=None, proxy=None):
+    """Same as _req but returns (json, response_headers) tuple."""
+    kwargs = {"timeout": DEFAULT_TIMEOUT}
+    if payload is not None:
+        kwargs["json"] = payload
+        kwargs["headers"] = {**HEADERS, "content-type": "application/json", **(extra or {})}
+    elif extra:
+        kwargs["headers"] = {**HEADERS, **extra}
+    else:
+        kwargs["headers"] = HEADERS
+    if proxy:
+        kwargs["proxy"] = proxy
+
+    for _ in range(3):
+        try:
+            r = await session.request(method, url, **kwargs)
+            try:
+                return r.json(), dict(r.headers)
+            except (json.JSONDecodeError, ValueError):
+                return {"_status": r.status_code, "_text": r.text}, dict(r.headers)
+        except RequestsError:
+            await asyncio.sleep(2)
+    return None, {}
+
+
 async def get_json(s, url, proxy=None):
     return await _req(s, "GET", url, proxy=proxy)
 
@@ -204,19 +229,30 @@ async def poll_imap_verification(
 
 
 # ── API token verification ───────────────────────────────────
-async def verify_token(account_id: str, api_token: str, log=logger.info) -> bool:
-    """Validate token by calling Workers AI inference."""
+async def verify_token(account_id: str, api_token: str, log=logger.info) -> tuple[bool, float]:
+    """Validate token by calling Workers AI inference.
+
+    Returns (valid: bool, neurons_used: float).
+    Reads `cf-ai-neurons` response header for precise usage tracking.
+    """
     url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/meta/llama-3.2-1b-instruct"
+    neurons = 0.0
     async with AsyncSession(impersonate="chrome131") as s:
-        resp = await post_json(
-            s, url, {"prompt": "Say hi in one word"},
+        resp, headers = await _req_with_headers(
+            s, "POST", url, {"prompt": "Say hi in one word"},
             extra={"Authorization": f"Bearer {api_token}"},
         )
+        # Extract neuron usage from response header
+        raw = headers.get("cf-ai-neurons") or headers.get("Cf-Ai-Neurons", "0")
+        try:
+            neurons = float(raw)
+        except (ValueError, TypeError):
+            neurons = 0.0
     if resp and resp.get("success"):
-        log(f"[Verify] WORKS: {resp['result'].get('response', '')[:40]}")
-        return True
+        log(f"[Verify] WORKS: {resp['result'].get('response', '')[:40]} | neurons={neurons}")
+        return True, neurons
     log(f"[Verify] failed: {resp.get('errors') if resp else 'no response'}")
-    return False
+    return False, 0.0
 
 
 # ── 9router DB injection ─────────────────────────────────────
@@ -462,8 +498,10 @@ class AccountFarmer:
 
         # ── Phase 3: Validate + Save ──
         status = "created"
+        neurons_used = 0.0
         if api_token and account_id:
-            status = "active" if await verify_token(account_id, api_token, log=log) else "token_unverified"
+            valid, neurons_used = await verify_token(account_id, api_token, log=log)
+            status = "active" if valid else "token_unverified"
         elif verified:
             status = "verified_no_token"
 
@@ -476,6 +514,7 @@ class AccountFarmer:
             "email_verified": verified,
             "api_token": api_token,
             "neurons_quota": 10000,
+            "neurons_used_verify": round(neurons_used, 2),
             "status": status,
         }
 
