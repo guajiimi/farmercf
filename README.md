@@ -42,3 +42,6 @@ Residential proxy required for CF POST endpoints. Add proxies to `proxy.txt`:
 http://user:***@host:port
 socks5://user:pass@host:port
 ```
+
+## Docs
+- [AUTH_FLOW.md](docs/AUTH_FLOW.md) — Full auth pipeline deep-dive with core logic
