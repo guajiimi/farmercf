@@ -19,19 +19,43 @@ import asyncio
 import json
 import sys
 import argparse
+import os
 from pathlib import Path
+from dotenv import load_dotenv
 from loguru import logger
 
 from core import AccountFarmer, NeuronTracker
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
+# Load .env at startup
+load_dotenv(Path(__file__).parent / ".env")
+
 
 def load_config() -> dict:
+    """Load config from .env first, then config.json as fallback."""
+    cfg = {}
+    # From .env
+    cfg["email_provider"] = os.environ.get("EMAIL_PROVIDER", "tempmail")
+    cfg["imap_host"] = os.environ.get("IMAP_HOST", "imap.gmail.com")
+    cfg["imap_port"] = int(os.environ.get("IMAP_PORT", "993"))
+    cfg["imap_user"] = os.environ.get("IMAP_USER", "")
+    cfg["imap_pass"] = os.environ.get("IMAP_PASS", "")
+    cfg["imap_timeout"] = int(os.environ.get("IMAP_TIMEOUT", "240"))
+    cfg["capsolver_api_key"] = os.environ.get("CAPSOLVER_API_KEY", "")
+    cfg["solverify_api_key"] = os.environ.get("SOLVERIFY_API_KEY", "")
+    cfg["twocaptcha_api_key"] = os.environ.get("TWOCAPTCHA_API_KEY", "")
+    cfg["proxy_file"] = os.environ.get("PROXY_FILE", "proxy.txt")
+    cfg["accounts_file"] = os.environ.get("ACCOUNTS_FILE", "accounts.json")
+    cfg["farm_create_retries"] = int(os.environ.get("FARM_CREATE_RETRIES", "6"))
+    cfg["inject_9router"] = os.environ.get("INJECT_9ROUTER", "false").lower() == "true"
+
+    # Override with config.json if exists
     if CONFIG_PATH.exists():
-        return json.loads(CONFIG_PATH.read_text())
-    logger.error(f"config.json not found. Copy config.example.json → config.json")
-    sys.exit(1)
+        file_cfg = json.loads(CONFIG_PATH.read_text())
+        cfg.update({k: v for k, v in file_cfg.items() if v})
+
+    return cfg
 
 
 def setup_logger(verbose: bool = False):

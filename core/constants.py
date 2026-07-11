@@ -63,15 +63,6 @@ LEGAL_COUNTRIES = [
     "nz", "ie", "ph", "my", "ng",
 ]
 
-# ── Anti-Detection: Email Domains ──────────────────────────────
-EMAIL_DOMAINS = [
-    "gmail.com",
-    "outlook.com",
-    "protonmail.com",
-    "icloud.com",
-    "yahoo.com",
-]
-
 # ── Anti-Detection: Password Patterns ─────────────────────────
 # Each generates a unique-looking password with different structure
 PASSWORD_PATTERNS = [

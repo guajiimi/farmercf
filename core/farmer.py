@@ -41,11 +41,11 @@ from loguru import logger
 from .constants import (
     CF_API, CF_SIGNUP_URL, FALLBACK_SITEKEY, STRATUS_COMMIT,
     API_TOKEN_PERMISSIONS, HEADERS, DEFAULT_TIMEOUT,
-    TLS_FINGERPRINTS, LOCALE_POOL, LEGAL_COUNTRIES, EMAIL_DOMAINS,
+    TLS_FINGERPRINTS, LOCALE_POOL, LEGAL_COUNTRIES,
     PASSWORD_PATTERNS,
 )
 from .captcha import CaptchaSolver
-from .email import poll_imap_verification
+from .email import generate_email, poll_verification, EMAIL_PROVIDER
 
 
 # ── Proxy helpers ────────────────────────────────────────────
@@ -91,19 +91,8 @@ class FakeIdentity:
         self.tls = random.choice(TLS_FINGERPRINTS)
         self.locale, self.accept_lang = random.choice(LOCALE_POOL)
         self.country = random.choice(LEGAL_COUNTRIES)
-        self.domain = random.choice(EMAIL_DOMAINS)
         self.pwd_pattern = random.choice(PASSWORD_PATTERNS)
         self.platform = random.choice(["Windows", "macOS", "Linux", "Chrome OS"])
-
-    def gen_email(self, base: str = "") -> str:
-        suffix = "".join(random.choices(string.ascii_lowercase, k=8)) + str(random.randint(100, 999))
-        if base and self.domain == "gmail.com":
-            return f"{base}+{suffix}@{self.domain}"
-        return f"{suffix}@{self.domain}"
-
-    def gen_password(self) -> str:
-        letters = "".join(random.choices(string.ascii_letters, k=14))
-        return self.pwd_pattern(letters)
 
     def make_legal_stamp(self) -> str:
         raw = f"ts:{int(time.time()*1000)}/stratus_commit:{STRATUS_COMMIT}/country:{self.country}"
@@ -117,8 +106,12 @@ class FakeIdentity:
             "sec-ch-ua-platform": f'"{self.platform}"',
         }
 
+    def gen_password(self) -> str:
+        letters = "".join(random.choices(string.ascii_letters, k=14))
+        return self.pwd_pattern(letters)
+
     def describe(self) -> str:
-        return f"tls={self.tls} locale={self.locale} country={self.country} domain={self.domain} platform={self.platform}"
+        return f"tls={self.tls} locale={self.locale} country={self.country} platform={self.platform}"
 
 
 # ── HTTP helpers ─────────────────────────────────────────────
@@ -292,15 +285,8 @@ class AccountFarmer:
         self.proxies = load_proxies(self.proxy_file) if self.proxy_file else []
         self.accounts_file = Path(cfg.get("accounts_file", "accounts.json"))
 
-        # IMAP config
-        self.imap_host = cfg.get("imap_host", "")
-        self.imap_port = int(cfg.get("imap_port", 993))
-        self.imap_user = cfg.get("imap_user", "")
-        self.imap_pass = cfg.get("imap_pass", "")
-
-        # Email domains (can override defaults)
-        self.email_domains = cfg.get("email_domains", [])
-        self.email_base = cfg.get("farm_email_base", "")
+        # Email provider config (from .env or config.json)
+        self.email_provider = cfg.get("email_provider", EMAIL_PROVIDER)
 
         # 9router injection
         self.inject_9router = cfg.get("inject_9router", False)
@@ -327,13 +313,12 @@ class AccountFarmer:
         """
         # Generate unique identity for this registration
         identity = FakeIdentity()
-        if self.email_domains:
-            identity.domain = random.choice(self.email_domains)
 
         log(f"[Farm] identity: {identity.describe()}")
 
         created = None
         email_addr = None
+        email_provider_name = None
         password = None
         session = None
         max_retries = self.cfg.get("farm_create_retries", 6)
@@ -343,8 +328,6 @@ class AccountFarmer:
             # Fresh identity per retry attempt too
             if attempt > 1:
                 identity = FakeIdentity()
-                if self.email_domains:
-                    identity.domain = random.choice(self.email_domains)
                 log(f"[Create {attempt}/{max_retries}] new identity: {identity.describe()}")
 
             s = AsyncSession(impersonate=identity.tls, headers=identity.make_headers())
@@ -381,10 +364,12 @@ class AccountFarmer:
                 # Human-like delay
                 await asyncio.sleep(random.uniform(2, 5))
 
-                # Step 4: Create user
-                email_addr = identity.gen_email(self.email_base)
+                # Step 4: Generate email via multi-provider
+                email_addr, email_provider_name = await generate_email(self.email_provider)
                 password = identity.gen_password()
                 legal_stamp = identity.make_legal_stamp()
+
+                log(f"[Create] email={email_addr} provider={email_provider_name}")
 
                 resp = await post_json(
                     s, f"{CF_API}/user/create",
@@ -441,11 +426,9 @@ class AccountFarmer:
                             {"emailVerificationRequest": "welcome"},
                             headers=identity.make_headers())
 
-            # Poll IMAP for verification token
-            vtok = await poll_imap_verification(
+            # Poll for verification token (auto-detects provider)
+            vtok = await poll_verification(
                 email_addr,
-                self.imap_host, self.imap_port,
-                self.imap_user, self.imap_pass,
                 timeout=self.cfg.get("imap_timeout", 240),
                 log=log,
             )
@@ -519,8 +502,8 @@ class AccountFarmer:
                 "tls": identity.tls,
                 "locale": identity.locale,
                 "country": identity.country,
-                "domain": identity.domain,
                 "platform": identity.platform,
+                "email_provider": email_provider_name,
             },
         }
 

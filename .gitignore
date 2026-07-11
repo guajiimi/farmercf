@@ -1,4 +1,5 @@
 config.json
+.env
 accounts.json
 proxy.txt
 neuron_usage.json
