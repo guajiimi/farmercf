@@ -1,6 +1,9 @@
 config.json
 accounts.json
 proxy.txt
+neuron_usage.json
+gsuite_cookies.json
+gsuite_error.png
 __pycache__/
 *.pyc
 .env

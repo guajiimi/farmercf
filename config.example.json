@@ -1,13 +1,18 @@
 {
-    "host": "0.0.0.0",
-    "port": 8107,
     "captcha_provider": "capsolver",
     "capsolver_api_key": "YOUR_CAPSOLVER_KEY",
+    "solverify_api_key": "YOUR_SOLVERIFY_KEY",
     "twocaptcha_api_key": "YOUR_2CAPTCHA_KEY",
     "twocaptcha_timeout": 120,
-    "farm_domain": "gmail.com",
-    "farm_email_base": "yourbase",
     "farm_create_retries": 6,
+    "farm_email_base": "yourbase",
+    "email_domains": [
+        "gmail.com",
+        "outlook.com",
+        "protonmail.com",
+        "icloud.com",
+        "yahoo.com"
+    ],
     "proxy_file": "proxy.txt",
     "accounts_file": "accounts.json",
     "imap_host": "imap.gmail.com",
@@ -15,5 +20,7 @@
     "imap_user": "your@gmail.com",
     "imap_pass": "your-app-password",
     "imap_timeout": 240,
-    "inject_9router": false
+    "inject_9router": false,
+    "gsuite_email": "",
+    "gsuite_password": ""
 }

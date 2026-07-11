@@ -1,17 +1,25 @@
 """
-cfcaptcha.core.farmer — Pure HTTP Cloudflare Workers AI account farmer.
+farmercf.core.farmer — Pure HTTP Cloudflare Workers AI account farmer.
 
 Flow (reverse-engineered from real signup HAR):
   bootstrap → captcha/challenge → solve Turnstile → user/create →
   persistence/user(emailVerificationRequest) → poll IMAP →
   user/email-verification → accounts → user/tokens → validate
 
-Zero browser dependency. Uses curl_cffi with Chrome TLS fingerprint
-impersonation (impersonate="chrome131") to evade CF challenges.
+Zero browser dependency. curl_cffi with random Chrome TLS fingerprint
+per registration for anti-detection.
 
-Supports multiple captcha solver backends:
-  - Solverify (default) — createTask/getTaskResult pattern
-  - 2Captcha — in.php/res.php pattern
+Anti-detection features:
+  - Random TLS fingerprint (10 Chrome versions)
+  - Random locale/Accept-Language (12 locales)
+  - Random legal_stamp country (12 countries)
+  - Random email domain (5 domains)
+  - Random password pattern (5 patterns)
+  - Human-like delays between steps
+  - Proxy rotation with auto-fallback
+
+Supports captcha solver providers with auto-fallback:
+  CapSolver → Solverify → 2Captcha
 """
 
 import asyncio
@@ -21,32 +29,23 @@ import base64
 import random
 import string
 import re
-import imaplib
-import email as email_lib
 import uuid
 import sqlite3
+import fcntl
 from pathlib import Path
 from datetime import datetime, timezone
 
 from curl_cffi.requests import AsyncSession, RequestsError
 from loguru import logger
 
-
-# ── Constants ────────────────────────────────────────────────
-CF_API = "https://dash.cloudflare.com/api/v4"
-CF_SIGNUP_URL = "https://dash.cloudflare.com/sign-up"
-FALLBACK_SITEKEY = "0x4AAAAAAAJel0iaAR3mgkjp"
-STRATUS_COMMIT = "43768e5f0b36b3c6c3c5ed00afa10affa55b38db"
-
-# Workers AI permission group IDs (3 — includes account read)
-API_TOKEN_PERMISSIONS = [
-    {"id": "644535f4ed854494a59cb289d634b257"},
-    {"id": "a92d2450e05d4e7bb7d0a64968f83d11"},
-    {"id": "bacc64e0f6c34fc0883a1223f938a104"},
-]
-
-HEADERS = {"x-cross-site-security": "dash"}
-DEFAULT_TIMEOUT = 45
+from .constants import (
+    CF_API, CF_SIGNUP_URL, FALLBACK_SITEKEY, STRATUS_COMMIT,
+    API_TOKEN_PERMISSIONS, HEADERS, DEFAULT_TIMEOUT,
+    TLS_FINGERPRINTS, LOCALE_POOL, LEGAL_COUNTRIES, EMAIL_DOMAINS,
+    PASSWORD_PATTERNS,
+)
+from .captcha import CaptchaSolver
+from .email import poll_imap_verification
 
 
 # ── Proxy helpers ────────────────────────────────────────────
@@ -54,10 +53,10 @@ def parse_proxy_line(line: str) -> str | None:
     """Parse proxy.txt line into curl_cffi proxy URL.
 
     Accepts:
-      host:port:user:pass        -> http://user:pass@host:port
-      host:port                  -> http://host:port
+      host:port:user:pass  -> http://user:pass@host:port
+      host:port            -> http://host:port
       http://user:pass@host:port -> pass-through
-      socks5://...               -> pass-through
+      socks5://...         -> pass-through
     """
     line = line.strip()
     if not line or line.startswith("#"):
@@ -74,7 +73,6 @@ def parse_proxy_line(line: str) -> str | None:
 
 
 def load_proxies(proxy_file: Path) -> list[str]:
-    """Load proxies from file."""
     if not proxy_file.exists():
         return []
     proxies = []
@@ -85,147 +83,107 @@ def load_proxies(proxy_file: Path) -> list[str]:
     return proxies
 
 
+# ── Anti-Detection: Random Identity Generator ─────────────────
+class FakeIdentity:
+    """Generate unique fingerprint per registration."""
+
+    def __init__(self):
+        self.tls = random.choice(TLS_FINGERPRINTS)
+        self.locale, self.accept_lang = random.choice(LOCALE_POOL)
+        self.country = random.choice(LEGAL_COUNTRIES)
+        self.domain = random.choice(EMAIL_DOMAINS)
+        self.pwd_pattern = random.choice(PASSWORD_PATTERNS)
+        self.platform = random.choice(["Windows", "macOS", "Linux", "Chrome OS"])
+
+    def gen_email(self, base: str = "") -> str:
+        suffix = "".join(random.choices(string.ascii_lowercase, k=8)) + str(random.randint(100, 999))
+        if base and self.domain == "gmail.com":
+            return f"{base}+{suffix}@{self.domain}"
+        return f"{suffix}@{self.domain}"
+
+    def gen_password(self) -> str:
+        letters = "".join(random.choices(string.ascii_letters, k=14))
+        return self.pwd_pattern(letters)
+
+    def make_legal_stamp(self) -> str:
+        raw = f"ts:{int(time.time()*1000)}/stratus_commit:{STRATUS_COMMIT}/country:{self.country}"
+        return base64.b64encode(raw.encode()).decode()
+
+    def make_headers(self) -> dict:
+        """Generate unique headers for this identity."""
+        return {
+            **HEADERS,
+            "Accept-Language": self.accept_lang,
+            "sec-ch-ua-platform": f'"{self.platform}"',
+        }
+
+    def describe(self) -> str:
+        return f"tls={self.tls} locale={self.locale} country={self.country} domain={self.domain} platform={self.platform}"
+
+
 # ── HTTP helpers ─────────────────────────────────────────────
-async def _req(session, method, url, payload=None, extra=None, proxy=None):
+async def _req(session, method, url, payload=None, extra=None, proxy=None, headers=None):
     """curl_cffi request with Chrome TLS fingerprint."""
+    base_headers = headers or HEADERS
     kwargs = {"timeout": DEFAULT_TIMEOUT}
     if payload is not None:
         kwargs["json"] = payload
-        kwargs["headers"] = {**HEADERS, "content-type": "application/json", **(extra or {})}
+        kwargs["headers"] = {**base_headers, "content-type": "application/json", **(extra or {})}
     elif extra:
-        kwargs["headers"] = {**HEADERS, **extra}
+        kwargs["headers"] = {**base_headers, **extra}
     else:
-        kwargs["headers"] = HEADERS
+        kwargs["headers"] = base_headers
     if proxy:
         kwargs["proxy"] = proxy
 
-    for _ in range(3):
+    for attempt in range(3):
         try:
             r = await session.request(method, url, **kwargs)
             try:
                 return r.json()
             except (json.JSONDecodeError, ValueError):
                 return {"_status": r.status_code, "_text": r.text}
-        except RequestsError:
-            await asyncio.sleep(2)
+        except RequestsError as e:
+            if attempt < 2:
+                await asyncio.sleep(2)
     return None
 
 
-async def _req_with_headers(session, method, url, payload=None, extra=None, proxy=None):
+async def _req_with_headers(session, method, url, payload=None, extra=None, proxy=None, headers=None):
     """Same as _req but returns (json, response_headers) tuple."""
+    base_headers = headers or HEADERS
     kwargs = {"timeout": DEFAULT_TIMEOUT}
     if payload is not None:
         kwargs["json"] = payload
-        kwargs["headers"] = {**HEADERS, "content-type": "application/json", **(extra or {})}
+        kwargs["headers"] = {**base_headers, "content-type": "application/json", **(extra or {})}
     elif extra:
-        kwargs["headers"] = {**HEADERS, **extra}
+        kwargs["headers"] = {**base_headers, **extra}
     else:
-        kwargs["headers"] = HEADERS
+        kwargs["headers"] = base_headers
     if proxy:
         kwargs["proxy"] = proxy
 
-    for _ in range(3):
+    for attempt in range(3):
         try:
             r = await session.request(method, url, **kwargs)
             try:
                 return r.json(), dict(r.headers)
             except (json.JSONDecodeError, ValueError):
                 return {"_status": r.status_code, "_text": r.text}, dict(r.headers)
-        except RequestsError:
-            await asyncio.sleep(2)
+        except RequestsError as e:
+            if attempt < 2:
+                await asyncio.sleep(2)
     return None, {}
 
 
-async def get_json(s, url, proxy=None):
-    return await _req(s, "GET", url, proxy=proxy)
+async def get_json(s, url, proxy=None, headers=None):
+    return await _req(s, "GET", url, proxy=proxy, headers=headers)
 
+async def post_json(s, url, payload, extra=None, proxy=None, headers=None):
+    return await _req(s, "POST", url, payload, extra, proxy=proxy, headers=headers)
 
-async def post_json(s, url, payload, extra=None, proxy=None):
-    return await _req(s, "POST", url, payload, extra, proxy=proxy)
-
-
-async def put_json(s, url, payload, proxy=None):
-    return await _req(s, "PUT", url, payload, proxy=proxy)
-
-
-# ── Email/Password generators ────────────────────────────────
-def gen_email(domain: str, base: str = "") -> str:
-    suffix = "".join(random.choices(string.ascii_lowercase, k=8)) + str(random.randint(100, 999))
-    if base and domain == "gmail.com":
-        # Gmail plus addressing: base+suffix@gmail.com
-        return f"{base}+{suffix}@{domain}"
-    return suffix + "@" + domain
-
-
-def gen_password() -> str:
-    return "".join(random.choices(string.ascii_letters, k=10)) + str(random.randint(10, 99)) + "-Aa1!"
-
-
-def make_legal_stamp(country: str = "id") -> str:
-    raw = f"ts:{int(time.time()*1000)}/stratus_commit:{STRATUS_COMMIT}/country:{country}"
-    return base64.b64encode(raw.encode()).decode()
-
-
-# ── IMAP email verification ──────────────────────────────────
-async def poll_imap_verification(
-    email_addr: str,
-    imap_host: str,
-    imap_port: int,
-    imap_user: str,
-    imap_pass: str,
-    timeout: int = 240,
-    log=logger.info,
-) -> str | None:
-    """Poll Gmail via IMAP for CF verification link, return token."""
-    log(f"[IMAP] polling for {email_addr} (max {timeout}s)...")
-    seen = set()
-    start = time.time()
-
-    while time.time() - start < timeout:
-        try:
-            mail = imaplib.IMAP4_SSL(imap_host, imap_port)
-            mail.login(imap_user, imap_pass)
-            mail.select("INBOX")
-
-            status, messages = mail.search(None, f'(TO "{email_addr}")')
-            if status == "OK":
-                for num in messages[0].split():
-                    if num in seen:
-                        continue
-                    seen.add(num)
-
-                    status, data = mail.fetch(num, "(RFC822)")
-                    if status != "OK":
-                        continue
-
-                    msg = email_lib.message_from_bytes(data[0][1])
-                    body = ""
-                    if msg.is_multipart():
-                        for part in msg.walk():
-                            if part.get_content_type() == "text/plain":
-                                body = part.get_payload(decode=True).decode("utf-8", errors="ignore")
-                                break
-                    else:
-                        body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
-
-                    # CF verification link patterns
-                    link = re.search(r"/email-verification\?token=([A-Za-z0-9_\-]+)", body)
-                    if link:
-                        mail.logout()
-                        return link.group(1)
-                    tok = re.search(r"[?&]token=([A-Za-z0-9_\-]{40,})", body)
-                    if tok:
-                        mail.logout()
-                        return tok.group(1)
-
-            mail.logout()
-        except Exception as e:
-            log(f"[IMAP] error: {e}")
-
-        await asyncio.sleep(8)
-
-    log("[IMAP] timeout — no verification email")
-    return None
+async def put_json(s, url, payload, proxy=None, headers=None):
+    return await _req(s, "PUT", url, payload, proxy=proxy, headers=headers)
 
 
 # ── API token verification ───────────────────────────────────
@@ -233,7 +191,6 @@ async def verify_token(account_id: str, api_token: str, log=logger.info) -> tupl
     """Validate token by calling Workers AI inference.
 
     Returns (valid: bool, neurons_used: float).
-    Reads `cf-ai-neurons` response header for precise usage tracking.
     """
     url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/meta/llama-3.2-1b-instruct"
     neurons = 0.0
@@ -242,20 +199,22 @@ async def verify_token(account_id: str, api_token: str, log=logger.info) -> tupl
             s, "POST", url, {"prompt": "Say hi in one word"},
             extra={"Authorization": f"Bearer {api_token}"},
         )
-        # Extract neuron usage from response header
+        if not resp:
+            log("[Verify] no response")
+            return False, 0.0
         raw = headers.get("cf-ai-neurons") or headers.get("Cf-Ai-Neurons", "0")
         try:
             neurons = float(raw)
         except (ValueError, TypeError):
             neurons = 0.0
-    if resp and resp.get("success"):
-        log(f"[Verify] WORKS: {resp['result'].get('response', '')[:40]} | neurons={neurons}")
+    if resp.get("success"):
+        log(f"[Verify] WORKS: {resp.get('result', {}).get('response', '')[:40]} | neurons={neurons}")
         return True, neurons
-    log(f"[Verify] failed: {resp.get('errors') if resp else 'no response'}")
+    log(f"[Verify] failed: {resp.get('errors', resp)}")
     return False, 0.0
 
 
-# ── 9router DB injection ─────────────────────────────────────
+# ── 9router DB injection ──────────────────────────────────────
 ROUTER_DB = Path.home() / ".9router" / "db" / "data.sqlite"
 ROUTER_CONNECTION_NAME = "CfcFarmer"
 
@@ -321,17 +280,14 @@ def inject_to_9router(api_token: str, account_id: str) -> int | None:
 
 # ── Core farmer ──────────────────────────────────────────────
 class AccountFarmer:
-    """Pure HTTP Cloudflare account farmer.
+    """Pure HTTP Cloudflare account farmer with anti-detection.
 
-    One session = one account. Uses curl_cffi with Chrome TLS
-    fingerprint impersonation — zero browser dependency.
+    One session = one account. Each registration gets a unique
+    TLS fingerprint, locale, country, email domain, and password pattern.
     """
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        self.domain = cfg.get("farm_domain", "")
-        self.captcha_key = cfg.get("solverify_api_key", "") or cfg.get("twocaptcha_api_key", "")
-        self.captcha_provider = cfg.get("captcha_provider", "solverify")
         self.proxy_file = Path(cfg.get("proxy_file", ""))
         self.proxies = load_proxies(self.proxy_file) if self.proxy_file else []
         self.accounts_file = Path(cfg.get("accounts_file", "accounts.json"))
@@ -342,21 +298,21 @@ class AccountFarmer:
         self.imap_user = cfg.get("imap_user", "")
         self.imap_pass = cfg.get("imap_pass", "")
 
+        # Email domains (can override defaults)
+        self.email_domains = cfg.get("email_domains", [])
+        self.email_base = cfg.get("farm_email_base", "")
+
         # 9router injection
         self.inject_9router = cfg.get("inject_9router", False)
 
-        # Solver
-        self._solver = None
-        provider = cfg.get("captcha_provider", "2captcha")
-        if provider == "solverify" and cfg.get("solverify_api_key"):
-            from .solverify import CaptchaSolver
-            self._solver = CaptchaSolver("solverify", cfg["solverify_api_key"])
-        elif provider == "capsolver" and cfg.get("capsolver_api_key"):
-            from .solverify import CaptchaSolver
-            self._solver = CaptchaSolver("capsolver", cfg["capsolver_api_key"])
-        elif provider == "2captcha" and cfg.get("twocaptcha_api_key"):
-            from .solverify import CaptchaSolver
-            self._solver = CaptchaSolver("2captcha", cfg["twocaptcha_api_key"])
+        # Captcha solver — unified with auto-fallback
+        self._solver = CaptchaSolver(
+            providers=[
+                ("capsolver", cfg.get("capsolver_api_key", "")),
+                ("solverify", cfg.get("solverify_api_key", "")),
+                ("2captcha", cfg.get("twocaptcha_api_key", "")),
+            ]
+        )
 
     def _random_proxy(self) -> str | None:
         if not self.proxies:
@@ -366,21 +322,33 @@ class AccountFarmer:
     async def farm_one(self, log=logger.info) -> dict | None:
         """Farm one Cloudflare account. Full flow via pure HTTP.
 
+        Each call generates a unique identity (TLS, locale, country, domain, password).
         Returns account dict or None on failure.
         """
-        session = None
-        email_addr = password = None
+        # Generate unique identity for this registration
+        identity = FakeIdentity()
+        if self.email_domains:
+            identity.domain = random.choice(self.email_domains)
+
+        log(f"[Farm] identity: {identity.describe()}")
+
         created = None
+        email_addr = None
+        password = None
+        session = None
         max_retries = self.cfg.get("farm_create_retries", 6)
 
-        # ── Phase 1: Create account (retry with fresh sessions) ──
+        # ── Phase 1: Create account (retry with fresh identity each time) ──
         for attempt in range(1, max_retries + 1):
-            s = AsyncSession(impersonate="chrome131", headers=HEADERS)
+            # Fresh identity per retry attempt too
+            if attempt > 1:
+                identity = FakeIdentity()
+                if self.email_domains:
+                    identity.domain = random.choice(self.email_domains)
+                log(f"[Create {attempt}/{max_retries}] new identity: {identity.describe()}")
+
+            s = AsyncSession(impersonate=identity.tls, headers=identity.make_headers())
             proxy = self._random_proxy()
-            if proxy:
-                log(f"[Create {attempt}/{max_retries}] proxy={proxy[:40]}...")
-            else:
-                log(f"[Create {attempt}/{max_retries}] no proxy")
 
             try:
                 # Step 1: Bootstrap
@@ -388,10 +356,16 @@ class AccountFarmer:
                 if not (boot and boot.get("success")):
                     raise RuntimeError(f"bootstrap failed: {boot}")
                 sec_token = boot["result"]["data"]["data"]["security_token"]
-                country = boot["result"]["data"].get("ip_country", "id").lower()
+                boot_country = boot["result"]["data"].get("ip_country", "id").lower()
+
+                # Use boot country if available, else identity country
+                country = boot_country if boot_country in LEGAL_COUNTRIES else identity.country
 
                 # Step 2: Get sitekey from challenge
-                chal = await get_json(s, f"{CF_API}/captcha/challenge?context=signup", proxy=proxy)
+                chal = await get_json(
+                    s, f"{CF_API}/captcha/challenge?context=signup",
+                    proxy=proxy, headers=identity.make_headers()
+                )
                 sitekey = (
                     chal["result"]["key"]
                     if chal and chal.get("success") and chal.get("result")
@@ -399,14 +373,19 @@ class AccountFarmer:
                 )
                 log(f"[Create] country={country} sitekey={sitekey[:20]}...")
 
-                # Step 3: Solve Turnstile
+                # Step 3: Solve Turnstile (with auto-fallback)
                 token = await self._solve_captcha(sitekey, log)
                 if not token:
                     raise RuntimeError("captcha solve failed")
 
+                # Human-like delay
+                await asyncio.sleep(random.uniform(2, 5))
+
                 # Step 4: Create user
-                email_addr = gen_email(self.domain, self.cfg.get("farm_email_base", ""))
-                password = gen_password()
+                email_addr = identity.gen_email(self.email_base)
+                password = identity.gen_password()
+                legal_stamp = identity.make_legal_stamp()
+
                 resp = await post_json(
                     s, f"{CF_API}/user/create",
                     {
@@ -415,8 +394,8 @@ class AccountFarmer:
                         "mrk_optin": True,
                         "security_token": sec_token,
                         "method": "Onboarding: New_v2",
-                        "locale": "en-US",
-                        "legal_stamp": make_legal_stamp(country),
+                        "locale": identity.locale,
+                        "legal_stamp": legal_stamp,
                         "opt_ins": {},
                         "mrktCheckboxDisplayed": False,
                         "hCaptchaDisplayed": False,
@@ -424,32 +403,45 @@ class AccountFarmer:
                     },
                     extra={"Referer": "https://dash.cloudflare.com/"},
                     proxy=proxy,
+                    headers=identity.make_headers(),
                 )
 
                 if resp and resp.get("success"):
                     created = resp["result"]
-                    session = s
+                    session = s  # Keep session alive for Phase 2
                     log(f"[Create] SUCCESS user_id={created['id']} email={email_addr}")
                     break
 
-                log(f"[Create] failed: {resp.get('errors') if resp else resp}")
+                err = resp.get("errors", resp) if resp else "no response"
+                log(f"[Create] failed: {err}")
 
             except Exception as e:
                 log(f"[Create] error: {e}")
 
+            # Cleanup failed session
             await s.close()
-            await asyncio.sleep(random.randint(4, 10))
+            session = None
 
-        if not created:
+            # Human-like backoff
+            delay = random.uniform(4, 10)
+            log(f"[Create] retrying in {delay:.1f}s...")
+            await asyncio.sleep(delay)
+
+        if not created or not session:
             return None
 
         # ── Phase 2: Verify + Token ──
+        account_id = None
+        api_token = None
+        verified = False
+
         try:
             # Trigger verification email
-            await post_json(session, f"{CF_API}/persistence/user", {"emailVerificationRequest": "welcome"})
+            await post_json(session, f"{CF_API}/persistence/user",
+                            {"emailVerificationRequest": "welcome"},
+                            headers=identity.make_headers())
 
             # Poll IMAP for verification token
-            verified = False
             vtok = await poll_imap_verification(
                 email_addr,
                 self.imap_host, self.imap_port,
@@ -458,43 +450,50 @@ class AccountFarmer:
                 log=log,
             )
             if vtok:
-                vr = await put_json(session, f"{CF_API}/user/email-verification", {"token": vtok})
+                vr = await put_json(session, f"{CF_API}/user/email-verification",
+                                    {"token": vtok},
+                                    headers=identity.make_headers())
                 verified = bool(vr and vr.get("success"))
             log(f"[Verify] email_verified={verified}")
 
             # Get account ID
-            accts = await get_json(session, f"{CF_API}/accounts?per_page=100")
-            account_id = (
-                accts["result"][0]["id"]
-                if accts and accts.get("success") and accts.get("result")
-                else None
-            )
+            accts = await get_json(session, f"{CF_API}/accounts?per_page=100",
+                                   headers=identity.make_headers())
+            if accts and accts.get("success") and accts.get("result"):
+                account_id = accts["result"][0]["id"]
             log(f"[Account] id={account_id}")
 
-            # Create API token (only after email verification)
-            api_token = None
+            # Create API token with 5 verified permissions
             if verified and account_id:
-                tk = await post_json(session, f"{CF_API}/user/tokens", {
-                    "name": "workers-ai",
-                    "condition": {},
-                    "policies": [{
-                        "effect": "allow",
-                        "resources": {f"com.cloudflare.api.account.{account_id}": "*"},
-                        "permission_groups": API_TOKEN_PERMISSIONS,
-                    }],
-                })
-                if tk and tk.get("success"):
-                    api_token = tk["result"]["value"]
-                    log(f"[Token] {api_token[:20]}...")
-                    log("[Token] waiting 12s for propagation...")
-                    await asyncio.sleep(12)
-                else:
-                    log(f"[Token] failed: {tk.get('errors') if tk else tk}")
+                # Retry token creation up to 3 times
+                for tk_attempt in range(1, 4):
+                    tk = await post_json(session, f"{CF_API}/user/tokens", {
+                        "name": f"workers-ai-{tk_attempt}",
+                        "condition": {},
+                        "policies": [{
+                            "effect": "allow",
+                            "resources": {f"com.cloudflare.api.account.{account_id}": "*"},
+                            "permission_groups": API_TOKEN_PERMISSIONS,
+                        }],
+                    }, headers=identity.make_headers())
+
+                    if tk and tk.get("success"):
+                        api_token = tk["result"]["value"]
+                        log(f"[Token] created (attempt {tk_attempt}): {api_token[:20]}...")
+                        log("[Token] waiting 12s for propagation...")
+                        await asyncio.sleep(12)
+                        break
+                    else:
+                        log(f"[Token] attempt {tk_attempt} failed: {tk.get('errors') if tk else tk}")
+                        if tk_attempt < 3:
+                            await asyncio.sleep(5)
             elif not verified:
                 log("[Token] skipped — email not verified")
 
         finally:
-            await session.close()
+            # Always close session
+            if session:
+                await session.close()
 
         # ── Phase 3: Validate + Save ──
         status = "created"
@@ -516,12 +515,17 @@ class AccountFarmer:
             "neurons_quota": 10000,
             "neurons_used_verify": round(neurons_used, 2),
             "status": status,
+            "identity": {
+                "tls": identity.tls,
+                "locale": identity.locale,
+                "country": identity.country,
+                "domain": identity.domain,
+                "platform": identity.platform,
+            },
         }
 
-        # Save to accounts.json
         self._save_account(acc)
 
-        # Inject to 9router DB if enabled
         if self.inject_9router and api_token and account_id:
             pr = inject_to_9router(api_token, account_id)
             if pr:
@@ -559,28 +563,40 @@ class AccountFarmer:
                 results["accounts"].append(acc)
 
             if i < count - 1:
-                await asyncio.sleep(random.uniform(2, 5))
+                delay = random.uniform(3, 8)
+                log(f"[Batch] waiting {delay:.1f}s...")
+                await asyncio.sleep(delay)
 
         return results
 
     async def _solve_captcha(self, sitekey: str, log=logger.info) -> str | None:
-        """Solve Turnstile using configured provider."""
-        if self._solver:
-            return await self._solver.solve_turnstile(
-                sitekey=sitekey,
-                page_url=CF_SIGNUP_URL,
-                log=log,
-            )
-        else:
-            log("[Captcha] no solver configured")
-            return None
+        """Solve Turnstile using configured providers with auto-fallback."""
+        return await self._solver.solve_turnstile(
+            sitekey=sitekey,
+            page_url=CF_SIGNUP_URL,
+            log=log,
+        )
 
     def _load_accounts(self) -> list[dict]:
         if self.accounts_file.exists():
-            return json.loads(self.accounts_file.read_text())
+            try:
+                return json.loads(self.accounts_file.read_text())
+            except (json.JSONDecodeError, ValueError):
+                return []
         return []
 
     def _save_account(self, acc: dict):
-        accs = self._load_accounts()
-        accs.append(acc)
-        self.accounts_file.write_text(json.dumps(accs, indent=2))
+        """Thread-safe save with file lock (prevents race condition)."""
+        with open(self.accounts_file, "a+") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            f.seek(0)
+            try:
+                content = f.read()
+                accs = json.loads(content) if content.strip() else []
+            except (json.JSONDecodeError, ValueError):
+                accs = []
+            accs.append(acc)
+            f.seek(0)
+            f.truncate()
+            f.write(json.dumps(accs, indent=2))
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)

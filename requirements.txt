@@ -1,5 +1,3 @@
-fastapi>=0.100.0
-uvicorn
 curl_cffi>=0.15.0
 loguru
-httpx
+camoufox
